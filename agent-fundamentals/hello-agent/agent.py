@@ -1,116 +1,105 @@
+"""hello-agent: a correct, honestly-labeled function-calling agent loop.
+
+Demonstrates the structured tool-calling pattern used by OpenAI/Groq-style
+APIs (the mechanism behind Schick et al. 2023, Toolformer) — this is NOT
+ReAct (Yao et al. 2022). See vs-literature.md for why that distinction
+matters and what a real ReAct loop would need instead.
+"""
+
 import os
 import json
 from dotenv import load_dotenv
 from groq import Groq
 
+from tools import TOOL_MAP, TOOL_SCHEMAS, validate_arguments
+
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# 1. Define real Python functions
-def get_weather(location: str) -> str:
-    # Mock weather tool
-    return f"The current weather in {location} is 22°C (72°F) and sunny."
+SYSTEM_PROMPT = (
+    "You are a helpful AI assistant equipped with tools. "
+    "Use tools whenever necessary to fulfill the user's request accurately."
+)
 
-def calculate_expression(expression: str) -> str:
-    try:
-        # Safe evaluation for basic math
-        result = eval(expression, {"__builtins__": None}, {})
-        return f"Result: {result}"
-    except Exception as e:
-        return f"Error evaluating expression: {str(e)}"
 
-# 2. Map tool names to python functions for invocation
-tool_map = {
-    "get_weather": get_weather,
-    "calculate_expression": calculate_expression
-}
+class FunctionCallingAgent:
+    """Minimal structured tool-calling loop with validated arguments,
+    safe execution, and an explicit (non-silent) iteration-limit outcome."""
 
-# 3. Define schema for Groq API
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a given city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City name"}
-                },
-                "required": ["location"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_expression",
-            "description": "Evaluate a mathematical expression",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "expression": {"type": "string", "description": "e.g., 25 * 4 + 10"}
-                },
-                "required": ["expression"],
-            },
-        },
-    }
-]
+    def __init__(self, model="openai/gpt-oss-20b", max_iterations=5, temperature=0.0):
+        self.model = model
+        self.max_iterations = max_iterations
+        self.temperature = temperature
 
-def run_agent(user_prompt: str):
-    # Initialize conversation history with system instructions
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful AI assistant equipped with tools. "
-                "Use tools whenever necessary to fulfill the user's request accurately."
+    def run(self, user_prompt: str) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        steps = []
+
+        for iteration in range(1, self.max_iterations + 1):
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                temperature=self.temperature,
             )
-        },
-        {"role": "user", "content": user_prompt}
-    ]
+            msg = response.choices[0].message
+            messages.append(msg)
 
-    print(f"\n--- Starting Task: '{user_prompt}' ---")
+            if not msg.tool_calls:
+                return {
+                    "status": "success",
+                    "final_answer": msg.content,
+                    "iterations": iteration,
+                    "steps": steps,
+                }
 
-    # Execution loop (max 5 iterations to prevent infinite loops)
-    for i in range(5):
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.0
-        )
+            for call in msg.tool_calls:
+                name = call.function.name
+                try:
+                    args = json.loads(call.function.arguments)
+                except json.JSONDecodeError as e:
+                    result = f"Error: malformed arguments ({e})"
+                else:
+                    error = validate_arguments(name, args)
+                    result = f"Error: {error}" if error else TOOL_MAP[name](**args)
 
-        response_message = response.choices[0].message
-        messages.append(response_message)
-
-        # Check if model wants to call a tool
-        if response_message.tool_calls:
-            for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
-
-                print(f"-> [Agent Decision]: Call tool '{function_name}' with args {arguments}")
-
-                # Execute local tool function
-                function_to_call = tool_map[function_name]
-                tool_output = function_to_call(**arguments)
-
-                print(f"<- [Tool Result]: {tool_output}")
-
-                # Feed tool output back into conversation history
+                steps.append({
+                    "iteration": iteration,
+                    "tool": name,
+                    "arguments": call.function.arguments,
+                    "result": result,
+                })
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": tool_output,
+                    "tool_call_id": call.id,
+                    "name": name,
+                    "content": str(result),
                 })
-        else:
-            # If no tool calls were requested, task is complete
-            print(f"\n[Final Answer]:\n{response_message.content}")
-            break
+
+        # Explicit outcome instead of the original's silent drop-off.
+        return {
+            "status": "max_iterations_reached",
+            "final_answer": f"Stopped after {self.max_iterations} iterations without a final answer.",
+            "iterations": self.max_iterations,
+            "steps": steps,
+        }
+
+
+def run_agent(user_prompt: str) -> dict:
+    """CLI-friendly wrapper, kept for parity with the original script's entry point."""
+    agent = FunctionCallingAgent()
+    result = agent.run(user_prompt)
+
+    print(f"\n--- Task: '{user_prompt}' ---")
+    for step in result["steps"]:
+        print(f"[iter {step['iteration']}] {step['tool']}({step['arguments']}) -> {step['result']}")
+    print(f"\n[{result['status']}]\n{result['final_answer']}")
+    return result
+
 
 if __name__ == "__main__":
-    # Test query requiring multi-tool reasoning
     run_agent("What is the weather in Tokyo, and what is 22 multiplied by 5?")
